@@ -13,13 +13,36 @@ DRIVER_DIR=$BUILD_DIR/mwifiex
 PATCH_FILE=$script_dir/ps5-iw620.patch
 RECOVER_PATCH=$script_dir/ps5-iw620-cmd-timeout-recover.patch
 KERNEL71_PATCH=$script_dir/ps5-iw620-kernel71-compat.patch
+RTNL_PATCH=$script_dir/ps5-iw620-rtnl-bounded-wait.patch
 
 MODULE_DIR=/lib/modules/$KERNEL_RELEASE/extra/ps5-iw620
 MODPROBE_CONF=/etc/modprobe.d/ps5-iw620.conf
 FW_NAME=nxp/pcieuartiw620_combo_v1.bin
 FW_PATH=/lib/firmware/$FW_NAME
 
-MOAL_OPTIONS="fw_name=$FW_NAME pcie_int_mode=1 drv_mode=1 cfg80211_wext=4 sta_name=mlan ext_scan=1 auto_fw_reload=0 wifi_reset_config=0 sched_scan=0 ps_mode=0 auto_ds=0 amsdu_disable=0"
+# Power-save / aggregation tuning. This was ps_mode=0 auto_ds=0 amsdu_disable=0;
+# changed to 2 2 1 on 2026-08-16 after a cold boot on 7.1.3-hdmifix associated
+# and held the link with 2 2 1 on this exact patch stack. 2 2 1 is also what the
+# linux-ps5 package's /etc/modprobe.d/moal.conf ships, so the two files now agree.
+#
+# Note MODPROBE_CONF (ps5-iw620.conf) sorts AFTER moal.conf, so whatever is set
+# here silently overrides the packaged file. Keep them in sync or the packaged
+# one becomes dead config. Revert to 0 0 0 here if a build regresses on it.
+MOAL_OPTIONS="fw_name=$FW_NAME pcie_int_mode=1 drv_mode=1 cfg80211_wext=4 sta_name=mlan ext_scan=1 wifi_reset_config=0 sched_scan=0 ps_mode=2 auto_ds=2 amsdu_disable=1"
+
+# Firmware auto-reset after a hang. OFF by default and deliberately separate:
+# both options are required together (woal_request_fw_reload() rejects every
+# mode with -EINVAL unless indrstcfg's low byte is 1 or 2, and the module
+# default is 0xffffffff), neither is tested on PS5 hardware, and each attempt
+# costs a cold power cycle. Enable for one experiment at a time with:
+#
+#   sudo FW_RESET_OPTIONS="indrstcfg=2 auto_fw_reload=3" ./install.sh
+#
+# auto_fw_reload=3 is BIT0 enable | BIT1 in-band reset (FW_RELOAD_PCIE_INBAND_RESET,
+# mode 6). Use auto_fw_reload=1 for FW_RELOAD_PCIE_RESET (mode 4, function-level
+# reset); the device does advertise FLReset+ in DevCap.
+FW_RESET_OPTIONS=${FW_RESET_OPTIONS:-auto_fw_reload=0}
+MOAL_OPTIONS="$MOAL_OPTIONS $FW_RESET_OPTIONS"
 
 usage() {
 	cat <<EOF
@@ -71,6 +94,14 @@ prepare_source() {
 	say "Checking out $REF"
 	git_driver checkout "$REF"
 
+	# Reset to pristine $REF before patching. Without this, a tree left over
+	# from a previous run still carries the OLD version of a patch, so an
+	# edited patch matches neither the apply nor the reverse-apply check and
+	# the run dies with "does not apply cleanly". Build artifacts are left
+	# alone; make rebuilds what changed.
+	say "Resetting driver source to pristine $REF"
+	git_driver reset --hard "$REF" >/dev/null
+
 	if git_driver apply --check "$PATCH_FILE" >/dev/null 2>&1; then
 		say "Applying PS5 IW620 patch"
 		git_driver apply "$PATCH_FILE"
@@ -101,6 +132,18 @@ prepare_source() {
 		else
 			die "kernel71 compat patch does not apply cleanly in $DRIVER_DIR"
 		fi
+	fi
+
+	# Applied last: it touches moal_sta_cfg80211.c, which the kernel71 compat
+	# patch also edits, so it is generated against the post-kernel71 tree.
+	[ -f "$RTNL_PATCH" ] || die "patch file not found: $RTNL_PATCH"
+	if git_driver apply --check "$RTNL_PATCH" >/dev/null 2>&1; then
+		say "Applying RTNL bounded-wait patch"
+		git_driver apply "$RTNL_PATCH"
+	elif git_driver apply -R --check "$RTNL_PATCH" >/dev/null 2>&1; then
+		say "RTNL bounded-wait patch is already applied"
+	else
+		die "rtnl bounded-wait patch does not apply cleanly in $DRIVER_DIR"
 	fi
 }
 

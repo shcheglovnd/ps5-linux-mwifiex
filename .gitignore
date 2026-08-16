@@ -1,0 +1,2 @@
+# install.sh clones the NXP driver source here and builds in place.
+build/
